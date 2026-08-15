@@ -1,166 +1,747 @@
-"""★ THIS IS THE ONLY FILE YOU NEED TO EDIT. ★
+"""
+Prediction pipeline for the Explaining Markets competition.
 
-`predict(event)` is called once per competition event, after the webhook has
-already been verified for you. Return one prediction per focal asset. Everything
-else in this repo (webhook verification, dedupe, submission) is plumbing.
+Pipeline:
 
-The default implementation asks an OpenAI model for a calibrated percentile. If
-`OPENAI_API_KEY` is not set, it returns a 0.5 baseline so the full deploy →
-receive → submit round-trip still works without burning credits. Replace the body
-of `predict` with whatever strategy you like — the only contract is the return
-shape documented below.
+    webhook event
+        |
+        v
+    information_url
+        |
+        v
+    DisclosureBundle
+        |
+        v
+    normalize_disclosures()
+        |
+        v
+    text representation
+        |
+        v
+    LLM feature extraction
+        |
+        v
+    raw quantitative score
+        |
+        v
+    empirical percentile
+        |
+        v
+    one prediction per focal asset
+
+The Explaining Markets API specifies that information_url returns:
+
+    {
+        "schema_version": "...",
+        "event_id": "...",
+        "generated_at": "...",
+        "items": [...]
+    }
+
+Each DisclosureItem contains either:
+    - inline "content"
+    OR
+    - a by-reference "url"
+
+Never assume a top-level "summary" field exists.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
-import os
+import time
+from typing import Any
 
 import httpx
-from openai import OpenAI
-from pydantic import BaseModel, Field
 
-from explaining_markets.config import openai_model
-
-_openai: OpenAI | None = None  # lazy: importing this file must not require a key
-_openai_warned = False         # one-shot warning when no key is configured
-
-# Timeouts, sized against the 5-minute prediction window that opens when your
-# handler ACKs the webhook. Worst case is 15 + (120 x 2) + 15 = 270s, which
-# fits with ~30s to spare. Nothing upstream retries a failed prediction — once
-# the delivery is ACKed the platform considers it done — so the one retry here
-# is the only one you get. Raising either value can push you past the deadline.
-SUMMARY_TIMEOUT_SECONDS = 15.0
-LLM_TIMEOUT_SECONDS = 120.0
-LLM_MAX_RETRIES = 1
+from database import get_recent_raw_scores, log_prediction
+from extractor import extract_features_from_transcript
+from model import raw_score, raw_score_to_percentile
 
 
-def predict(event: dict) -> list[dict]:
-    """Return predictions for one Explaining Markets event.
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
-    `event` is the verified webhook payload. Useful fields:
-      event["event_type"]          e.g. "EARNINGS_RELEASE"
-      event["focal_assets"]        list of {"identifier_type", "identifier_value"}
-      event["information_url"]     short-lived signed URL with the event summary JSON
-      event["prediction_deadline"] ISO timestamp; submit before this fires
+INFORMATION_TIMEOUT_SECONDS = 20.0
+REFERENCE_TIMEOUT_SECONDS = 20.0
 
-    Required return: a list of dicts, one per focal asset:
-      [{"identifier_value": "AAPL", "predicted_percentile": 0.71}, ...]
+MAX_REFERENCE_BYTES = 25 * 1024 * 1024  # 25 MB safety limit
+MAX_TEXT_CHARS = 100_000               # Prevent accidentally huge LLM input
 
-    `predicted_percentile` is a float in [0, 1] — where you predict the asset's
-    next-day abnormal (market-adjusted) return will rank across all of the
-    quarter's event outcomes: 0 = the quarter's most negative reaction,
-    0.50 = median, 1 = its most positive. It's a cross-sectional rank across the
-    quarter's events, not a percentile within the asset's own history.
+
+# ---------------------------------------------------------------------------
+# Generic helpers
+# ---------------------------------------------------------------------------
+
+def _short(value: Any, max_chars: int = 500) -> str:
     """
-    summary = httpx.get(event["information_url"], timeout=SUMMARY_TIMEOUT_SECONDS)
-    summary.raise_for_status()
-    summary_json = summary.json()
+    Convert a value to a compact string suitable for logs.
 
-    # One model call per focal asset, in series — so the LLM budget below is
-    # per asset, not per event. Today every event carries a single asset; if
-    # that changes and you need several, run them concurrently rather than
-    # raising the timeout.
-    return [
-        {
-            "identifier_value": asset["identifier_value"],
-            "predicted_percentile": _ask_llm(
-                summary=summary_json,
-                ticker=asset["identifier_value"],
-                event_type=event["event_type"],
-            ),
-        }
-        for asset in event["focal_assets"]
-    ]
+    We deliberately avoid logging entire disclosures because the disclosure
+    may contain a large amount of event information.
+    """
+    text = str(value)
+
+    if len(text) <= max_chars:
+        return text
+
+    return text[:max_chars] + "...[truncated]"
 
 
-# ----------------------------------------------------------------------
-# Default strategy: a single calibrated LLM call per asset.
-# Swap this out, or rewrite `predict` entirely, to enter your own model.
-# ----------------------------------------------------------------------
+def _content_to_text(content: Any) -> str:
+    """
+    Convert DisclosureItem.content into text.
 
-
-class Prediction(BaseModel):
-    """Structured response shape for the LLM call.
-
-    The `Field(ge=0, le=1)` constraint flows through into the JSON schema OpenAI's
-    structured-outputs mode enforces during decoding, so the model is guaranteed to
-    return a percentile in [0, 1] — no manual clamping or fallback parsing needed.
+    The API currently documents `facts` as an array of strings, but future
+    disclosure kinds may use other JSON shapes. We therefore normalize
+    structured content without assuming every kind is a string.
     """
 
-    predicted_percentile: float = Field(ge=0.0, le=1.0)
+    if content is None:
+        return ""
 
+    # facts -> ["fact 1", "fact 2", ...]
+    if isinstance(content, list):
+        parts = []
 
-SYSTEM_PROMPT = """\
-You are a senior equity analyst predicting how a stock will react to an event.
+        for item in content:
+            if item is None:
+                continue
 
-Predict a single percentile in [0, 1] for how the focal asset's next-day
-abnormal return will rank across all of the quarter's event outcomes:
-0 = the quarter's most negative reaction, 0.50 = median, 1 = its most positive.
-The relevant return is the *unexpected*, market-adjusted return — a
-great-but-fully-priced-in beat is not a top-decile event.
+            if isinstance(item, str):
+                parts.append(item)
+            else:
+                parts.append(
+                    json.dumps(
+                        item,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                )
 
-Calibration discipline:
-- Long-run base rates: about 25% of events land "up" (>0.75), 50% "neutral"
-  (0.25-0.75), 25% "down" (<0.25). Default toward 0.40-0.60 when signals are
-  mixed or modest.
-- Reserve values above 0.80 or below 0.20 for cases with unambiguous,
-  multi-signal evidence. Do not exceed 0.90 or fall below 0.10 without
-  overwhelming, lopsided evidence.
-- Tone alone (confident vs hedging language) should move you no more than
-  ~0.03 absent quantitative confirmation.
-"""
+        return "\n".join(parts)
 
+    # Plain text
+    if isinstance(content, str):
+        return content
 
-def _ask_llm(*, summary: dict, ticker: str, event_type: str) -> float:
-    """Ask the configured model for a calibrated percentile via structured outputs.
-
-    Returns the model's `predicted_percentile`. Falls back to 0.5 if no
-    `OPENAI_API_KEY` is configured or the model refuses; the [0, 1] bound is
-    enforced by the JSON schema, not by us.
-    """
-    global _openai, _openai_warned
-    if not os.environ.get("OPENAI_API_KEY"):
-        if not _openai_warned:
-            print(
-                "[WARN] OPENAI_API_KEY not set — submitting 0.5 placeholder. "
-                "Set the key (or edit predict.py) for real predictions."
-            )
-            _openai_warned = True
-        return 0.5
-    if _openai is None:
-        # picks up OPENAI_API_KEY from env
-        _openai = OpenAI(
-            timeout=LLM_TIMEOUT_SECONDS, max_retries=LLM_MAX_RETRIES
+    # Structured JSON object
+    if isinstance(content, dict):
+        return json.dumps(
+            content,
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
         )
 
-    summary_text = summary.get("summary") if isinstance(summary, dict) else None
-    if not summary_text:
-        summary_text = json.dumps(summary)
-    summary_text = summary_text[:8000]
+    # Numbers / booleans / other JSON primitives
+    return str(content)
 
-    user_prompt = (
-        f"Event type: {event_type}\n"
-        f"Ticker: {ticker}\n\n"
-        f"Event summary:\n{summary_text}\n\n"
-        "Weigh, in roughly this order:\n"
-        "  1. Quantitative surprise vs expectations — revenue, EPS, segment metrics.\n"
-        "  2. Guidance / outlook — raises, holds, cuts vs the prior trajectory.\n"
-        "  3. Strategic shifts — product launches, M&A, capital allocation, leadership.\n"
-        "  4. Tone and confidence in management commentary (small weight).\n"
-        "  5. Risks called out — regulatory, supply chain, demand, competition.\n\n"
-        f"Predict the next-day unexpected-return percentile for {ticker}."
+
+def _validate_sha256(raw_bytes: bytes, expected_sha256: str) -> None:
+    """
+    Verify the SHA-256 digest supplied by the API for a by-reference item.
+    """
+
+    if not expected_sha256:
+        return
+
+    actual_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+
+    if actual_sha256.lower() != expected_sha256.lower():
+        raise ValueError(
+            "SHA-256 mismatch for referenced disclosure: "
+            f"expected={expected_sha256}, actual={actual_sha256}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# By-reference disclosure handling
+# ---------------------------------------------------------------------------
+
+def _fetch_referenced_content(
+    client: httpx.Client,
+    url: str,
+    expected_sha256: str | None = None,
+) -> str:
+    """
+    Fetch a DisclosureItem whose content is supplied through `url`.
+
+    The API specifies that large disclosure items may be supplied this way
+    instead of inline `content`.
+    """
+
+    if not url:
+        raise ValueError("Referenced disclosure has an empty URL")
+
+    response = client.get(
+        url,
+        timeout=REFERENCE_TIMEOUT_SECONDS,
+        follow_redirects=True,
     )
 
-    resp = _openai.chat.completions.parse(
-        model=openai_model(),
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        response_format=Prediction,
+    response.raise_for_status()
+
+    raw_bytes = response.content
+
+    if len(raw_bytes) > MAX_REFERENCE_BYTES:
+        raise ValueError(
+            "Referenced disclosure exceeds safety limit: "
+            f"{len(raw_bytes):,} bytes > {MAX_REFERENCE_BYTES:,}"
+        )
+
+    # Verify integrity when the API supplied sha256.
+    if expected_sha256:
+        _validate_sha256(raw_bytes, expected_sha256)
+
+    # First try JSON because disclosure content may itself be structured.
+    content_type = (
+        response.headers.get("content-type", "")
+        .lower()
     )
-    parsed = resp.choices[0].message.parsed
-    if parsed is None:
-        return 0.5  # model refused; competition expects a number
-    return parsed.predicted_percentile
+
+    if "json" in content_type:
+        try:
+            payload = response.json()
+            return _content_to_text(payload)
+        except ValueError:
+            # Fall through to UTF-8 decoding.
+            pass
+
+    # Otherwise treat it as textual content.
+    try:
+        return raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError(
+            "Referenced disclosure is not valid UTF-8 text and does not "
+            "appear to be JSON"
+        )
+
+
+# ---------------------------------------------------------------------------
+# DisclosureBundle parsing
+# ---------------------------------------------------------------------------
+
+def extract_disclosure_text(
+    information_url: str,
+    expected_event_id: str | None = None,
+) -> str:
+    """
+    Download and normalize the DisclosureBundle returned by information_url.
+
+    Expected API structure:
+
+        {
+            "schema_version": "1.0",
+            "event_id": "...",
+            "generated_at": "...",
+            "items": [
+                {
+                    "id": "...",
+                    "kind": "...",
+                    "source": "...",
+                    "content": ...
+                }
+            ]
+        }
+
+    or:
+
+        {
+            ...
+            "items": [
+                {
+                    "id": "...",
+                    "kind": "...",
+                    "source": "...",
+                    "url": "...",
+                    "bytes": ...,
+                    "sha256": "..."
+                }
+            ]
+        }
+    """
+
+    if not information_url:
+        raise ValueError("Event is missing information_url")
+
+    with httpx.Client(
+        timeout=INFORMATION_TIMEOUT_SECONDS,
+        follow_redirects=True,
+    ) as client:
+
+        response = client.get(information_url)
+        response.raise_for_status()
+
+        try:
+            bundle = response.json()
+        except ValueError as exc:
+            raise ValueError(
+                "information_url did not return valid JSON"
+            ) from exc
+
+        # ---------------------------------------------------------------
+        # Top-level bundle validation
+        # ---------------------------------------------------------------
+
+        if not isinstance(bundle, dict):
+            raise ValueError(
+                "information_url returned "
+                f"{type(bundle).__name__}, expected JSON object"
+            )
+
+        schema_version = bundle.get("schema_version")
+        bundle_event_id = bundle.get("event_id")
+        items = bundle.get("items")
+
+        print(
+            "[INFO] DisclosureBundle:"
+            f" schema_version={schema_version!r},"
+            f" event_id={bundle_event_id!r},"
+            f" items={len(items) if isinstance(items, list) else 'INVALID'}"
+        )
+
+        # event_id consistency check
+        if expected_event_id and bundle_event_id:
+            if bundle_event_id != expected_event_id:
+                raise ValueError(
+                    "DisclosureBundle event_id mismatch: "
+                    f"webhook={expected_event_id}, "
+                    f"bundle={bundle_event_id}"
+                )
+
+        # API requires items.
+        if not isinstance(items, list):
+            raise ValueError(
+                "information_url payload is missing a valid 'items' array"
+            )
+
+        if not items:
+            raise ValueError(
+                f"DisclosureBundle for event {expected_event_id} "
+                "contains zero disclosure items"
+            )
+
+        # ---------------------------------------------------------------
+        # Extract every disclosure item
+        # ---------------------------------------------------------------
+
+        text_parts: list[str] = []
+
+        inline_count = 0
+        reference_count = 0
+        skipped_count = 0
+
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                print(
+                    f"[WARN] Disclosure item {index} is not an object; "
+                    "skipping."
+                )
+                skipped_count += 1
+                continue
+
+            item_id = item.get("id")
+            kind = item.get("kind")
+            source = item.get("source")
+
+            content = item.get("content")
+            url = item.get("url")
+
+            has_content = content is not None
+            has_url = bool(url)
+
+            # API says an item is either inline OR by-reference.
+            if has_content and has_url:
+                raise ValueError(
+                    f"Disclosure item {item_id!r} contains both "
+                    "'content' and 'url'. API contract says these are "
+                    "mutually exclusive."
+                )
+
+            # -----------------------------------------------------------
+            # Inline content
+            # -----------------------------------------------------------
+
+            if has_content:
+                inline_count += 1
+
+                text = _content_to_text(content)
+
+                if text.strip():
+                    text_parts.append(
+                        f"[SOURCE: {source or 'unknown'} | "
+                        f"KIND: {kind or 'unknown'}]\n"
+                        f"{text}"
+                    )
+                else:
+                    print(
+                        f"[WARN] Disclosure item {item_id!r} has empty "
+                        "inline content."
+                    )
+
+                continue
+
+            # -----------------------------------------------------------
+            # By-reference content
+            # -----------------------------------------------------------
+
+            if has_url:
+                reference_count += 1
+
+                try:
+                    referenced_text = _fetch_referenced_content(
+                        client=client,
+                        url=url,
+                        expected_sha256=item.get("sha256"),
+                    )
+
+                    if referenced_text.strip():
+                        text_parts.append(
+                            f"[SOURCE: {source or 'unknown'} | "
+                            f"KIND: {kind or 'unknown'}]\n"
+                            f"{referenced_text}"
+                        )
+                    else:
+                        print(
+                            f"[WARN] Referenced disclosure item "
+                            f"{item_id!r} returned empty content."
+                        )
+
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Failed to fetch referenced disclosure "
+                        f"item {item_id!r}: {exc}"
+                    ) from exc
+
+                continue
+
+            # -----------------------------------------------------------
+            # Neither content nor URL
+            # -----------------------------------------------------------
+
+            skipped_count += 1
+
+            print(
+                f"[WARN] Disclosure item {item_id!r} has neither "
+                "'content' nor 'url'; skipping."
+            )
+
+        # ---------------------------------------------------------------
+        # Final validation
+        # ---------------------------------------------------------------
+
+        if not text_parts:
+            raise ValueError(
+                "DisclosureBundle contained no usable textual content "
+                f"(items={len(items)}, inline={inline_count}, "
+                f"references={reference_count}, skipped={skipped_count})"
+            )
+
+        combined_text = "\n\n".join(text_parts).strip()
+
+        if not combined_text:
+            raise ValueError(
+                "Disclosure normalization produced an empty string"
+            )
+
+        # Prevent accidentally feeding an enormous document to the LLM.
+        if len(combined_text) > MAX_TEXT_CHARS:
+            print(
+                "[WARN] Normalized disclosure is "
+                f"{len(combined_text):,} characters; "
+                f"truncating to {MAX_TEXT_CHARS:,}."
+            )
+
+            combined_text = combined_text[:MAX_TEXT_CHARS]
+
+        print(
+            "[INFO] Disclosure normalized successfully:"
+            f" inline={inline_count},"
+            f" references={reference_count},"
+            f" skipped={skipped_count},"
+            f" text_chars={len(combined_text):,}"
+        )
+
+        return combined_text
+
+
+# ---------------------------------------------------------------------------
+# Event validation
+# ---------------------------------------------------------------------------
+
+def _validate_event(event: dict) -> None:
+    """
+    Validate the minimum WebhookPayload fields required by predict().
+    """
+
+    if not isinstance(event, dict):
+        raise ValueError(
+            f"Event must be a dict, got {type(event).__name__}"
+        )
+
+    required_fields = [
+        "event_id",
+        "event_type",
+        "focal_assets",
+        "information_url",
+        "prediction_deadline",
+    ]
+
+    missing = [
+        field
+        for field in required_fields
+        if not event.get(field)
+    ]
+
+    if missing:
+        raise ValueError(
+            "Webhook event is missing required fields: "
+            + ", ".join(missing)
+        )
+
+    focal_assets = event["focal_assets"]
+
+    if not isinstance(focal_assets, list) or not focal_assets:
+        raise ValueError(
+            "Webhook event must contain at least one focal asset"
+        )
+
+    for index, asset in enumerate(focal_assets):
+
+        if not isinstance(asset, dict):
+            raise ValueError(
+                f"focal_assets[{index}] is not an object"
+            )
+
+        identifier = asset.get("identifier_value")
+
+        if not identifier:
+            raise ValueError(
+                f"focal_assets[{index}] is missing identifier_value"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Main prediction function
+# ---------------------------------------------------------------------------
+
+def predict(event: dict) -> list[dict]:
+    """
+    Generate one prediction for every focal asset in an Explaining Markets
+    event.
+
+    Important:
+
+    The disclosure/LLM extraction happens ONCE per event.
+
+    The current feature model does not contain asset-specific inputs, so
+    every focal asset receives the same event-level score. We still return
+    one prediction object per focal asset as required by the API.
+    """
+
+    started_at = time.time()
+
+    # ------------------------------------------------------------------
+    # 1. Validate webhook payload
+    # ------------------------------------------------------------------
+
+    _validate_event(event)
+
+    event_id = event["event_id"]
+
+    print(
+        f"\n[event {event_id}] "
+        f"Starting prediction pipeline"
+    )
+
+    print(
+        f"[event {event_id}] "
+        f"type={event.get('event_type')!r}, "
+        f"assets={len(event['focal_assets'])}, "
+        f"deadline={event.get('prediction_deadline')}"
+    )
+
+    # ------------------------------------------------------------------
+    # 2. Fetch + normalize disclosure
+    # ------------------------------------------------------------------
+
+    transcript_text = extract_disclosure_text(
+        information_url=event["information_url"],
+        expected_event_id=event_id,
+    )
+
+    elapsed = time.time() - started_at
+
+    print(
+        f"[event {event_id}] "
+        f"Disclosure fetched and normalized "
+        f"in {elapsed:.2f}s"
+    )
+
+    # ------------------------------------------------------------------
+    # 3. LLM feature extraction — ONCE per event
+    # ------------------------------------------------------------------
+
+    features = extract_features_from_transcript(
+        transcript_text
+    )
+
+    elapsed = time.time() - started_at
+
+    print(
+        f"[event {event_id}] "
+        f"LLM feature extraction completed "
+        f"in {elapsed:.2f}s"
+    )
+
+    print(
+        f"[event {event_id}] "
+        f"Extracted features: {features.model_dump()}"
+    )
+
+    # ------------------------------------------------------------------
+    # 4. Convert features → quantitative raw score
+    # ------------------------------------------------------------------
+
+    score = raw_score(features)
+
+    print(
+        f"[event {event_id}] "
+        f"Raw model score = {score:+.4f}"
+    )
+
+    # ------------------------------------------------------------------
+    # 5. Obtain historical calibration distribution
+    # ------------------------------------------------------------------
+
+    historical_scores = get_recent_raw_scores()
+
+    print(
+        f"[event {event_id}] "
+        f"Historical score count = {len(historical_scores)}"
+    )
+
+    # ------------------------------------------------------------------
+    # 6. Raw score → empirical percentile
+    # ------------------------------------------------------------------
+
+    predicted_percentile = raw_score_to_percentile(
+        new_score=score,
+        historical_scores=historical_scores,
+    )
+
+    # ------------------------------------------------------------------
+    # 7. Validate percentile
+    # ------------------------------------------------------------------
+
+    if not isinstance(predicted_percentile, (int, float)):
+        raise ValueError(
+            f"Model returned non-numeric percentile: "
+            f"{predicted_percentile!r}"
+        )
+
+    predicted_percentile = float(predicted_percentile)
+
+    if not 0.0 <= predicted_percentile <= 1.0:
+        raise ValueError(
+            f"Predicted percentile outside [0,1]: "
+            f"{predicted_percentile}"
+        )
+
+    predicted_percentile = round(
+        predicted_percentile,
+        4,
+    )
+
+    print(
+        f"[event {event_id}] "
+        f"Predicted percentile = {predicted_percentile:.4f}"
+    )
+
+    # ------------------------------------------------------------------
+    # 8. Create predictions for every focal asset
+    # ------------------------------------------------------------------
+
+    predictions: list[dict] = []
+
+    timestamp = int(time.time())
+
+    for asset in event["focal_assets"]:
+
+        ticker = asset["identifier_value"]
+
+        prediction = {
+            "identifier_value": ticker,
+            "predicted_percentile": predicted_percentile,
+        }
+
+        predictions.append(prediction)
+
+        # --------------------------------------------------------------
+        # 9. Persist local/Modal-volume prediction record
+        # --------------------------------------------------------------
+
+        log_prediction(
+            event_id=event_id,
+            timestamp=timestamp,
+            ticker=ticker,
+            raw_text=transcript_text,
+            features_dict=features.model_dump(),
+            raw_score_val=score,
+            prediction=predicted_percentile,
+        )
+
+        print(
+            f"[event {event_id}] "
+            f"{ticker}: percentile={predicted_percentile:.4f}"
+        )
+
+    # ------------------------------------------------------------------
+    # 10. Final structural validation
+    # ------------------------------------------------------------------
+
+    if not predictions:
+        raise ValueError(
+            f"No predictions generated for event {event_id}"
+        )
+
+    for prediction in predictions:
+
+        if not prediction.get("identifier_value"):
+            raise ValueError(
+                f"Prediction missing identifier_value: "
+                f"{prediction}"
+            )
+
+        percentile = prediction.get(
+            "predicted_percentile"
+        )
+
+        if not isinstance(percentile, (int, float)):
+            raise ValueError(
+                f"Prediction percentile is not numeric: "
+                f"{prediction}"
+            )
+
+        if not 0.0 <= float(percentile) <= 1.0:
+            raise ValueError(
+                f"Prediction percentile outside [0,1]: "
+                f"{prediction}"
+            )
+
+    elapsed = time.time() - started_at
+
+    print(
+        f"[event {event_id}] "
+        f"Prediction pipeline completed in {elapsed:.2f}s"
+    )
+
+    print(
+        f"[event {event_id}] "
+        f"Predictions: {predictions}\n"
+    )
+
+    return predictions

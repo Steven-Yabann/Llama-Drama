@@ -36,59 +36,48 @@ scope) to inject them correctly — otherwise it treats `request` as a query
 parameter and rejects every delivery with 422.
 """
 
+"""Modal deployment for the Explaining Markets starter.
+[... original docstring unchanged ...]
+"""
+
 import modal
 
-app = modal.App("explaining-markets-starter")
+app = modal.App("LLamaDrama-markets")
+
+# --- ADDED: persistent Volume for LlamaDrama's SQLite percentile history ---
+volume = modal.Volume.from_name("llamadrama-db-vol", create_if_missing=True)
 
 image = (
     modal.Image.debian_slim()
-    .pip_install("fastapi[standard]", "httpx", "openai", "pydantic")
-    .add_local_python_source("explaining_markets", "predict")
+    .pip_install(
+        "fastapi[standard]", "httpx", "openai", "pydantic",
+        # --- ADDED: your extraction pipeline's dependencies ---
+        "groq", "instructor", "python-dotenv"
+    )
+    .add_local_python_source(
+        "explaining_markets", "predict",
+        # --- ADDED: your own modules, so they're importable inside the container ---
+        "model", "extractor", "schemas", "database"
+    )
 )
 
-# Distributed key-value store for idempotency, keyed on the Webhook-Id header.
-# Three states:
-#
-#   "in_flight"   a job is running right now — skip duplicates so you never pay
-#                 for the same model call twice
-#   "done"        the API accepted a prediction — skip forever
-#   absent        never seen, or the last attempt raised — (re)run it
-#
-# Marking an event done up front would be the bug: a failed prediction would
-# look handled. This Dict persists across redeploys, so "done" is durable.
 seen_webhooks = modal.Dict.from_name("em-webhook-dedupe", create_if_missing=True)
-
-# Credentials are read from your local .env at deploy time (see .env.example).
-# Prefer Modal's secret store instead? See docs/advanced.md.
 secrets = [modal.Secret.from_dotenv(__file__)]
 
 
 def _claim(webhook_id):
-    """Reserve this webhook_id. False means it's already in flight or done.
-
-    `skip_if_exists` makes this an atomic claim, so two containers handling a
-    duplicate delivery at the same moment can't both win.
-    """
     if not webhook_id:
         return True
     return seen_webhooks.put(webhook_id, "in_flight", skip_if_exists=True)
 
 
 async def _claim_aio(webhook_id):
-    """`_claim` for the async route.
-
-    Modal's blocking interfaces run their own event loop under the hood, so
-    calling them from inside an `async def` stalls the loop — the exact problem
-    ACKing first is meant to solve. The `.aio` variants are the async-native
-    ones; the request path must use these, and only these.
-    """
     if not webhook_id:
         return True
     return await seen_webhooks.put.aio(webhook_id, "in_flight", skip_if_exists=True)
 
 
 def _release(webhook_id, submitted):
-    """Mark the claim done on success, or drop it so a redelivery can retry."""
     if not webhook_id:
         return
     if submitted:
@@ -97,15 +86,9 @@ def _release(webhook_id, submitted):
         seen_webhooks.pop(webhook_id, None)
 
 
-@app.function(image=image, secrets=secrets, timeout=600, retries=0)
+# --- ADDED: volumes={"/data": volume} on the function that actually runs predict() ---
+@app.function(image=image, secrets=secrets, timeout=600, retries=0, volumes={"/data": volume})
 def predict_and_submit(event: dict, webhook_id: str | None = None):
-    """Run the model and submit the prediction, off the request path.
-
-    Runs in its own container, so it is unaffected by the web endpoint scaling
-    down. The delivery has already been ACKed by the time this starts, which
-    means nothing upstream will retry it — the single retry configured on the
-    model call in predict.py is the only one you get.
-    """
     from explaining_markets.client import submit_predictions
     from explaining_markets.config import Config
     from explaining_markets.event_utils import is_test, neutral_predictions
@@ -120,8 +103,9 @@ def predict_and_submit(event: dict, webhook_id: str | None = None):
             config=Config.from_env(),
         )
         submitted = True
+        # --- ADDED: persist the Volume write so it survives container teardown ---
+        volume.commit()
     except Exception as exc:
-        # Log loudly — `modal app logs explaining-markets-starter` finds it.
         print(f"[ERROR] prediction failed for event {event.get('event_id')}: {exc}")
     finally:
         _release(webhook_id, submitted)
@@ -130,8 +114,8 @@ def predict_and_submit(event: dict, webhook_id: str | None = None):
 @app.function(image=image, secrets=secrets)
 @modal.asgi_app(label="explaining-markets")
 def web():
+    # [... unchanged from original ...]
     from fastapi import FastAPI, Request, Response
-
     from explaining_markets import WebhookVerificationError, verify_webhook
     from explaining_markets.config import Config
     from explaining_markets.event_utils import log_deadline
@@ -143,11 +127,10 @@ def web():
         return {"ok": True, "service": "explaining-markets-starter"}
 
     @api.post("/")
-    @api.post("/competition/webhook")  # alias, so an explicit-path URL also works
+    @api.post("/competition/webhook")
     async def competition_webhook(request: Request) -> Response:
         config = Config.from_env()
-
-        raw_body = await request.body()  # raw bytes — never request.json()
+        raw_body = await request.body()
         try:
             event = verify_webhook(
                 raw_body=raw_body,
@@ -162,11 +145,16 @@ def web():
             return Response(status_code=200)
 
         log_deadline(event)
-        # Everything slow happens after this 200 goes out. The portal's "Test
-        # Webhook" button sends a synthetic TEST event; it takes the same path
-        # and submits a neutral prediction (accepted by the API, never scored)
-        # so the test exercises your full receive -> submit loop.
         await predict_and_submit.spawn.aio(event, webhook_id)
         return Response(status_code=200)
 
     return api
+
+
+# --- ADDED: one-off DB init, run manually via `modal run modal_app.py::init_remote_db` ---
+@app.function(image=image, secrets=secrets, volumes={"/data": volume})
+def init_remote_db():
+    from database import init_db
+    init_db()
+    volume.commit()
+    print("✅ Remote DB schema initialized on Modal Volume.")
