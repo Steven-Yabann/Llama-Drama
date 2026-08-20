@@ -154,7 +154,7 @@ def web():
 # --- ADDED: one-off DB init, run manually via `modal run modal_app.py::init_remote_db` ---
 @app.function(image=image, secrets=secrets, volumes={"/data": volume})
 def init_remote_db():
-    from database import init_db
-    init_db()
+    from database import init_live_db
+    init_live_db()
     volume.commit()
-    print("✅ Remote DB schema initialized on Modal Volume.")
+    print("✅ Remote LIVE DB schema initialized on Modal Volume.")

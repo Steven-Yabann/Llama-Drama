@@ -19,7 +19,7 @@ if not GROQ_API_KEY:
 
 client = instructor.from_groq(
     Groq(api_key=GROQ_API_KEY),
-    mode=instructor.Mode.JSON,
+    mode=instructor.Mode.JSON_SCHEMA,
 )
 
 
@@ -45,18 +45,24 @@ def extract_features_from_transcript(
             result = client.chat.completions.create(
                 model="openai/gpt-oss-20b",
                 response_model=EarningsFeatures,
-                max_tokens=500,
+                max_tokens=2000,
                 messages=[
                     {
                         "role": "system",
                         "content": (
                             "You are a precise quantitative data extraction "
-                            "engine. Your sole task is to analyze corporate "
-                            "earnings disclosure information and map "
-                            "linguistic and numeric indicators into the exact "
-                            "schema requested. Be objective and ignore "
-                            "market hype. Do not invent information that "
-                            "is not present in the supplied disclosure."
+                            "engine.\n\n"
+                            "Extract only information supported by the "
+                            "supplied earnings disclosure.\n"
+                            "Do not invent facts.\n"
+                            "If the disclosure does not provide enough "
+                            "information for a categorical field, use "
+                            "'not_given'.\n"
+                            "If a numeric quantity is not explicitly "
+                            "available, use null when permitted by the "
+                            "schema.\n"
+                            "For confidence and prominence scores, return "
+                            "values between 0.0 and 1.0."
                         ),
                     },
                     {
